@@ -89,7 +89,6 @@ export class HuntScene extends Phaser.Scene {
   private healthPickups!: Phaser.Physics.Arcade.Group;
   private banner!: Phaser.GameObjects.Text;
   private bannerTimer?: Phaser.Time.TimerEvent;
-  private placedObstacles: Array<{ x: number; y: number }> = [];
   private wormTimers = new Map<string, Phaser.Time.TimerEvent>();
   private ambientTimer?: Phaser.Time.TimerEvent;
   private powerupTimer?: Phaser.Time.TimerEvent;
@@ -158,7 +157,6 @@ export class HuntScene extends Phaser.Scene {
     }
 
     this.obstacles = this.physics.add.staticGroup();
-    this.placedObstacles = [];
     this.placeObstacles(theme);
     this.placeDeco(theme);
 
@@ -423,18 +421,15 @@ export class HuntScene extends Phaser.Scene {
     const sub = SUB_LEVELS[subOf(this.levelIndex)]!;
     const tint = GEM_TINTS[this.theme];
     const gemName = t((GEM_I18N[this.theme] ?? 'gemAmethyst') as Parameters<typeof t>[0]);
-    let x: number;
-    let y: number;
-    let attempts = 0;
-    do {
-      x = Phaser.Math.Between(150, this.arenaW - 150);
-      y = Phaser.Math.Between(150, this.arenaH - 150);
-      attempts++;
-    } while (
-      attempts < 20 &&
-      (this.isPositionInObstacle(x, y) ||
-        Phaser.Math.Distance.Between(x, y, this.arenaW / 2, this.arenaH / 2) < sub.gemMinDist)
-    );
+    const cx = this.arenaW / 2;
+    const cy = this.arenaH / 2;
+    // Must land somewhere the player can actually walk to. Prefer far from the start; relax the
+    // distance if the arena is tight; only as an impossible last resort use the start itself.
+    const spot =
+      this.findClearSpot(80, (px, py) => Phaser.Math.Distance.Between(px, py, cx, cy) >= sub.gemMinDist)
+      ?? this.findClearSpot(80)
+      ?? { x: cx, y: cy };
+    const { x, y } = spot;
 
     this.gemItem = new GemItem(this, x, y, tint, gemName, 0.55);
     this.gemGroup.add(this.gemItem);
@@ -487,22 +482,11 @@ export class HuntScene extends Phaser.Scene {
   private spawnRandomPowerup(): void {
     if (this.over) return;
 
-    let attempts = 0;
-    let x: number;
-    let y: number;
-    const minDistFromPlayer = 150;
-
-    do {
-      x = Phaser.Math.Between(100, this.arenaW - 100);
-      y = Phaser.Math.Between(300, this.arenaH - 300);
-      attempts++;
-    } while (
-      (this.isPositionInObstacle(x, y) ||
-        Phaser.Math.Distance.Between(x, y, this.player.x, this.player.y) < minDistFromPlayer) &&
-      attempts < 20
-    );
-
-    if (attempts >= 50) return;
+    // Only drop on ground the player can reach — skip this cycle if no clear spot is found.
+    const spot = this.findClearSpot(30, (px, py) =>
+      Phaser.Math.Distance.Between(px, py, this.player.x, this.player.y) >= 150);
+    if (!spot) return;
+    const { x, y } = spot;
 
     const weaponType = Phaser.Math.RND.pick(POWERUP_WEAPON_TYPES);
     const powerup = new WeaponPowerup({ scene: this, x, y, weaponType });
@@ -521,22 +505,10 @@ export class HuntScene extends Phaser.Scene {
   private spawnRandomHealth(): void {
     if (this.over) return;
 
-    let attempts = 0;
-    let x: number;
-    let y: number;
-    const minDistFromPlayer = 10;
-
-    do {
-      x = Phaser.Math.Between(100, this.arenaW - 100);
-      y = Phaser.Math.Between(300, this.arenaH - 300);
-      attempts++;
-    } while (
-      (this.isPositionInObstacle(x, y) ||
-        Phaser.Math.Distance.Between(x, y, this.player.x, this.player.y) < minDistFromPlayer) &&
-      attempts < 20
-    );
-
-    if (attempts >= 50) return;
+    const spot = this.findClearSpot(30, (px, py) =>
+      Phaser.Math.Distance.Between(px, py, this.player.x, this.player.y) >= 10);
+    if (!spot) return;
+    const { x, y } = spot;
 
     const pickup = new HealthPickup(this, x, y);
     this.healthPickups.add(pickup);
@@ -550,15 +522,34 @@ export class HuntScene extends Phaser.Scene {
     });
   }
 
-  private isPositionInObstacle(x: number, y: number): boolean {
-    const r = 50;
-    const r2 = r * r;
-    for (const o of this.placedObstacles) {
-      const dx = x - o.x;
-      const dy = y - o.y;
-      if (dx * dx + dy * dy < r2) return true;
+  /** True if (x,y) is inside (or within `margin` of) any obstacle's ACTUAL collision body.
+   * Uses real body extents, so it correctly rejects the interior of large obstacles like the
+   * beach sea pools or swamp ponds — the old fixed-radius-around-centre check missed those and
+   * let gems/pickups land on impassable water. */
+  private isPositionInObstacle(x: number, y: number, margin = 28): boolean {
+    for (const o of this.obstacles.getChildren()) {
+      const b = (o as Phaser.GameObjects.GameObject).body as Phaser.Physics.Arcade.StaticBody | null;
+      if (!b) continue;
+      if (x > b.x - margin && x < b.x + b.width + margin &&
+          y > b.y - margin && y < b.y + b.height + margin) {
+        return true;
+      }
     }
     return false;
+  }
+
+  /** Pick a random spot clear of every obstacle body (so it's genuinely stand-on-able),
+   * optionally also satisfying `extra`. Returns null if none found within `tries`. */
+  private findClearSpot(tries: number, extra?: (x: number, y: number) => boolean): { x: number; y: number } | null {
+    const m = 150;
+    for (let i = 0; i < tries; i++) {
+      const x = Phaser.Math.Between(m, this.arenaW - m);
+      const y = Phaser.Math.Between(m, this.arenaH - m);
+      if (this.isPositionInObstacle(x, y)) continue;
+      if (extra && !extra(x, y)) continue;
+      return { x, y };
+    }
+    return null;
   }
 
   private spawnBubble(): void {
@@ -623,7 +614,6 @@ export class HuntScene extends Phaser.Scene {
         body.setOffset(28 * t.scale, 72 * t.scale);
       }
       this.obstacles.add(sprite);
-      this.placedObstacles.push({ x: t.x, y: t.y });
     }
 
     if (other.length > 0) {
@@ -634,7 +624,6 @@ export class HuntScene extends Phaser.Scene {
         const sprite = this.physics.add.staticSprite(x, y, tex);
         sprite.setDepth(1 + y / this.arenaH);
         this.obstacles.add(sprite);
-        this.placedObstacles.push({ x, y });
       }
     }
 
@@ -686,7 +675,6 @@ export class HuntScene extends Phaser.Scene {
       this.physics.add.existing(dummy, true);
       (dummy.body as Phaser.Physics.Arcade.StaticBody).setSize(bw, bh);
       this.obstacles.add(dummy);
-      this.placedObstacles.push({ x: cx, y: cy });
       placed++;
     }
   }
@@ -708,7 +696,6 @@ export class HuntScene extends Phaser.Scene {
       this.physics.add.existing(dummy, true);
       (dummy.body as Phaser.Physics.Arcade.StaticBody).setSize(w, h);
       this.obstacles.add(dummy);
-      this.placedObstacles.push({ x: cx, y: cy });
     }
   }
 
